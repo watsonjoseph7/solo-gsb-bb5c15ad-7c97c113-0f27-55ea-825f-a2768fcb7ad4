@@ -362,6 +362,76 @@ curl -s -X POST http://localhost:8000/measures/1/avoidance-preview \
 }
 ```
 
+### `POST /measures/{id}/time-preview` — 速度变化下的秒级时间线（预览，不写库）
+
+把已保存小节每个事件的起止偏移，按请求给出的**速度段数组**换算成**自小节开始的秒数**。
+偏移以**全音符时长为 1**；`start_bpm` / `end_bpm` 为**正十进制字符串**，表示**每分钟
+四分音符数**（如 `"120"`、`"90.5"`）。每段内 BPM 随偏移**线性变化**，段与段之间允许
+跳变；偏移 `x` 处 1 个偏移单位（全音符）历时 `240 / bpm(x)` 秒，事件起止的秒数即该
+函数从 0 到对应偏移的**跨段积分**（线性变化段的积分为对数形式
+`240·Δx·ln(b₁/b₀)/(b₁−b₀)`，恒定速度段为 `240·Δx/b`）。
+
+- 请求体：`segments` 为**非空**数组，每段含 `end` / `start_bpm` / `end_bpm`：
+  - `end` 为**正有理数字符串**（同时长格式）；各段 `end` **严格递增**，且**末段 `end`
+    必须等于小节目标时长**；第一段起点为 `0`，其余各段起点为前一段的 `end`；
+  - `start_bpm` / `end_bpm` 为该段起点、终点处的 BPM（正十进制字符串，拒绝 `0`、
+    负数、分数、科学计数法等）。
+- 同一偏移（包括跨声部共享的边界）只积分一次并**复用同一秒值**，因此共享边界的
+  `start_seconds` / `end_seconds` 完全一致；秒值输出为**六位小数字符串**。
+- 小节 ID 不存在返回 **404**；速度段不合法（空数组、`end` 非严格递增、末段不等于
+  目标时长、BPM 或 `end` 格式错误等）返回 **422**。该接口为**只读预览，不写入数据库**。
+
+```bash
+curl -s -X POST http://localhost:8000/measures/1/time-preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "segments": [
+      {"end": "1/2", "start_bpm": "120", "end_bpm": "120"},
+      {"end": "1",   "start_bpm": "120", "end_bpm": "60"}
+    ]
+  }'
+```
+
+例：小节时长 `1`，前半段恒定 120 BPM（1 个偏移单位历时 2 秒），后半段从 120 线性
+渐慢到 60。偏移 `1/4` → `0.5` 秒、`1/2` → `1` 秒、`3/4` → `1 + 2·ln(4/3)` ≈
+`1.575364` 秒、`1` → `1 + 2·ln 2` ≈ `2.386294` 秒：
+
+```json
+{
+  "measure_id": 1,
+  "target_duration": "1",
+  "voices": [
+    {"name": "melody", "events": [
+      {"id": "v1e1", "kind": "sound", "start_seconds": "0.000000", "end_seconds": "1.000000"},
+      {"id": "v1e2", "kind": "rest",  "start_seconds": "1.000000", "end_seconds": "1.575364"},
+      {"id": "v1e3", "kind": "sound", "start_seconds": "1.575364", "end_seconds": "2.386294"}
+    ]},
+    {"name": "bass", "events": [
+      {"id": "v2e1", "kind": "rest",  "start_seconds": "0.000000", "end_seconds": "0.500000"},
+      {"id": "v2e2", "kind": "sound", "start_seconds": "0.500000", "end_seconds": "2.386294"}
+    ]}
+  ]
+}
+```
+
+各字段含义：
+
+| 字段                            | 说明                                                     |
+| ------------------------------- | -------------------------------------------------------- |
+| `voices[].events[].id` / `kind` | 原事件 ID 与种类（`sound` / `rest`），与保存的小节一致   |
+| `start_seconds` / `end_seconds` | 事件起止偏移积分得到的秒数，六位小数字符串               |
+
+速度段不合法时的响应示例：
+
+```json
+{
+  "detail": {
+    "message": "invalid tempo segments; nothing was saved",
+    "reason": "last segment ends at 1/2, not at the target duration 1"
+  }
+}
+```
+
 > 在浏览器中打开 http://localhost:8000/ 可查看服务与接口清单，
 > http://localhost:8000/docs 为可直接发起请求的 Swagger UI。
 
@@ -378,7 +448,7 @@ python3 -m unittest discover -s tests -p 'test_grid.py'   # 仅核心逻辑（�
 
 ```
 app/
-  grid.py      # 核心逻辑：有理数解析、精确累加、边界并集切分网格、节奏等价匹配、循环对齐、等分刻度量化、双声部冲突静音（二分图最小权顶点覆盖，纯标准库）
+  grid.py      # 核心逻辑：有理数解析、精确累加、边界并集切分网格、节奏等价匹配、循环对齐、等分刻度量化、双声部冲突静音（二分图最小权顶点覆盖）、速度段秒数积分（纯标准库）
   db.py        # SQLite 连接、建表、读写（纯标准库）
   schemas.py   # Pydantic 请求/响应模型与校验
   main.py      # FastAPI 应用与路由（启动时初始化数据库）

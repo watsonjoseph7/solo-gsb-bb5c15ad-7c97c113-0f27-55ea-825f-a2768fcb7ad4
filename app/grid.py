@@ -7,6 +7,7 @@ the union of every voice's event boundaries.
 
 from __future__ import annotations
 
+import math
 import re
 import sys
 from bisect import bisect_right
@@ -751,3 +752,159 @@ def avoidance_muting(voice_a: dict, voice_b: dict) -> dict:
             (entry["event"]["duration"] for entry in muted), Fraction(0)
         ),
     }
+
+
+# --- Tempo maps: integrating event offsets into seconds -------------------------
+
+# A positive decimal string: "120", "90.5", "0.75" (no sign, no exponent,
+# digits required on both sides of the optional decimal point).
+_DECIMAL_RE = re.compile(r"^\d+(?:\.\d+)?$")
+
+# Offset units are whole notes; BPM counts quarter notes per minute and a
+# whole note holds 4 quarters, so at 1 BPM one offset unit lasts 240 s.
+_SECONDS_PER_UNIT_AT_1_BPM = 240.0
+
+
+def parse_positive_decimal(text: str) -> float:
+    """Parse a positive decimal string ("120", "90.5") into a float.
+
+    Raises ValueError on malformed input or non-positive values.
+    """
+    if not isinstance(text, str):
+        raise ValueError(f"decimal must be a string, got {type(text).__name__}")
+    if not _DECIMAL_RE.match(text.strip()):
+        raise ValueError(f"invalid decimal number: {text!r}")
+    value = float(text.strip())
+    if value <= 0:
+        raise ValueError(f"BPM must be positive, got {text!r}")
+    return value
+
+
+def format_seconds(value: float) -> str:
+    """Six-decimal string of a seconds value ("0.500000")."""
+    return f"{value:.6f}"
+
+
+class TempoMapInvalid(Exception):
+    """The tempo segments do not form a valid map over the measure."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"invalid tempo segments: {reason}")
+        self.reason = reason
+
+
+def build_tempo_map(segments: list[dict], target: Fraction) -> list[dict]:
+    """Validate raw tempo segments and attach implicit segment starts.
+
+    ``segments`` items are {"end": Fraction, "start_bpm": float,
+    "end_bpm": float}; a segment's start is 0 for the first segment and
+    the previous segment's end otherwise, so the segments must tile
+    [0, target] with strictly increasing ends and the last end equal to
+    ``target`` (the measure's target duration). BPM may jump between
+    segments. Returns the same segments with an explicit "start" offset.
+    """
+    if not segments:
+        raise TempoMapInvalid("at least one tempo segment is required")
+    prepared = []
+    start = Fraction(0)
+    for index, segment in enumerate(segments):
+        end = segment["end"]
+        if end <= start:
+            raise TempoMapInvalid(
+                f"segment {index + 1} ends at {format_rational(end)}, "
+                f"not strictly after {format_rational(start)}"
+            )
+        prepared.append(
+            {
+                "start": start,
+                "end": end,
+                "start_bpm": segment["start_bpm"],
+                "end_bpm": segment["end_bpm"],
+            }
+        )
+        start = end
+    if prepared[-1]["end"] != target:
+        raise TempoMapInvalid(
+            f"last segment ends at {format_rational(prepared[-1]['end'])}, "
+            f"not at the target duration {format_rational(target)}"
+        )
+    return prepared
+
+
+def _linear_bpm_seconds(start_bpm: float, end_bpm: float, span: float) -> float:
+    """Seconds to cross ``span`` offset units, BPM linear in the offset.
+
+    With BPM linear from ``start_bpm`` to ``end_bpm`` over the span, the
+    exact integral of 240/BPM is 240 * span * ln(end/start)/(end-start)
+    (span divided by the logarithmic mean of the endpoint BPMs); a
+    constant BPM gives 240 * span / BPM.
+    """
+    if start_bpm == end_bpm:
+        return _SECONDS_PER_UNIT_AT_1_BPM * span / start_bpm
+    delta = end_bpm - start_bpm
+    # log1p(delta/start) = ln(end/start), accurate even for tiny deltas.
+    return (
+        _SECONDS_PER_UNIT_AT_1_BPM
+        * span
+        * math.log1p(delta / start_bpm)
+        / delta
+    )
+
+
+def offset_to_seconds(prepared: list[dict], offset: Fraction) -> float:
+    """Seconds from the measure start to ``offset`` under the tempo map.
+
+    ``prepared`` comes from build_tempo_map; whole segments before the
+    offset are summed and the segment containing the offset contributes
+    its partial integral (BPM interpolated linearly in the offset).
+    """
+    total = 0.0
+    for segment in prepared:
+        if offset > segment["end"]:
+            total += _linear_bpm_seconds(
+                segment["start_bpm"],
+                segment["end_bpm"],
+                float(segment["end"] - segment["start"]),
+            )
+            continue
+        span = float(offset - segment["start"])
+        full_span = float(segment["end"] - segment["start"])
+        bpm_here = segment["start_bpm"] + (
+            segment["end_bpm"] - segment["start_bpm"]
+        ) * (span / full_span)
+        return total + _linear_bpm_seconds(
+            segment["start_bpm"], bpm_here, span
+        )
+    return total  # pragma: no cover - the last segment ends at the target
+
+
+def measure_time_preview(prepared: list[dict], voices: list[dict]) -> list[dict]:
+    """Map every voice's events to seconds under the tempo map.
+
+    One cache maps each distinct offset to its seconds value, so an
+    offset shared by several events (across or within voices) is
+    integrated once and every event reuses the identical value. Returns
+    [{"name": str, "events": [{"id", "kind", "start_seconds",
+    "end_seconds"}]}] with float seconds.
+    """
+    cache: dict[Fraction, float] = {}
+
+    def seconds_at(offset: Fraction) -> float:
+        if offset not in cache:
+            cache[offset] = offset_to_seconds(prepared, offset)
+        return cache[offset]
+
+    result = []
+    for voice in voices:
+        events = []
+        for event in voice["events"]:
+            events.append(
+                {
+                    "id": event["id"],
+                    "kind": event["kind"],
+                    "start_seconds": seconds_at(event["start"]),
+                    "end_seconds": seconds_at(event["end"]),
+                }
+            )
+        result.append({"name": voice["name"], "events": events})
+    return result

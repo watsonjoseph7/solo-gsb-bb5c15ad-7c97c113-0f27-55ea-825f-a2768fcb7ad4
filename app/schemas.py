@@ -6,7 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from .grid import parse_nonnegative_rational, parse_rational
+from .grid import parse_nonnegative_rational, parse_positive_decimal, parse_rational
 
 
 class EventIn(BaseModel):
@@ -252,3 +252,60 @@ class AvoidancePreviewOut(BaseModel):
     total_muted: str
     # Every original positive-length sound/sound conflict.
     conflicts: list[ConflictPairOut]
+
+
+class TempoSegmentIn(BaseModel):
+    """One tempo segment: BPM linear in the offset up to ``end``.
+
+    The segment starts at 0 (first segment) or at the previous segment's
+    ``end``. BPMs are positive decimal strings counting quarter notes
+    per minute and may jump between segments.
+    """
+
+    end: str = Field(examples=["1/2", "1"])
+    start_bpm: str = Field(examples=["120", "90.5"])
+    end_bpm: str = Field(examples=["120", "60"])
+
+    @field_validator("end")
+    @classmethod
+    def end_must_be_positive_rational(cls, value: str) -> str:
+        try:
+            parse_rational(value)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        return value
+
+    @field_validator("start_bpm", "end_bpm")
+    @classmethod
+    def bpm_must_be_positive_decimal(cls, value: str) -> str:
+        try:
+            parse_positive_decimal(value)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        return value
+
+
+class TimePreviewIn(BaseModel):
+    """Tempo map preview: segments tiling the whole target duration."""
+
+    segments: list[TempoSegmentIn] = Field(min_length=1)
+
+
+class TimedEventOut(BaseModel):
+    """An original event with its start/end integrated into seconds."""
+
+    id: str
+    kind: Literal["sound", "rest"]
+    start_seconds: str
+    end_seconds: str
+
+
+class TimedVoiceOut(BaseModel):
+    name: str
+    events: list[TimedEventOut]
+
+
+class TimePreviewOut(BaseModel):
+    measure_id: int
+    target_duration: str
+    voices: list[TimedVoiceOut]

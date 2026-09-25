@@ -772,3 +772,148 @@ def test_avoidance_preview_404_takes_precedence_over_same_voice():
         json={"voice_a": "x", "voice_b": "x"},
     )
     assert response.status_code == 404
+
+
+# --- POST /measures/{id}/time-preview ---------------------------------------
+
+# VALID_PAYLOAD (target 1) under a tempo map that holds 120 BPM for the
+# first half (1 offset unit = 2 s) then falls linearly to 60 BPM:
+#   offset 1/4 -> 0.5 s, 1/2 -> 1 s,
+#   3/4 -> 1 + 2*ln(4/3) = 1.575364... s, 1 -> 1 + 2*ln(2) = 2.386294... s
+TEMPO_PAYLOAD = {
+    "segments": [
+        {"end": "1/2", "start_bpm": "120", "end_bpm": "120"},
+        {"end": "1", "start_bpm": "120", "end_bpm": "60"},
+    ]
+}
+
+
+def test_time_preview_integrates_offsets_across_segments():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/time-preview", json=TEMPO_PAYLOAD
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["measure_id"] == measure_id
+    assert body["target_duration"] == "1"
+
+    melody, bass = body["voices"]
+    assert melody["name"] == "melody"
+    assert melody["events"] == [
+        {"id": "v1e1", "kind": "sound",
+         "start_seconds": "0.000000", "end_seconds": "1.000000"},
+        {"id": "v1e2", "kind": "rest",
+         "start_seconds": "1.000000", "end_seconds": "1.575364"},
+        {"id": "v1e3", "kind": "sound",
+         "start_seconds": "1.575364", "end_seconds": "2.386294"},
+    ]
+    assert bass["name"] == "bass"
+    assert bass["events"] == [
+        {"id": "v2e1", "kind": "rest",
+         "start_seconds": "0.000000", "end_seconds": "0.500000"},
+        {"id": "v2e2", "kind": "sound",
+         "start_seconds": "0.500000", "end_seconds": "2.386294"},
+    ]
+
+    # Offsets shared across voices reuse the same seconds value.
+    assert melody["events"][0]["start_seconds"] == bass["events"][0]["start_seconds"]
+    assert melody["events"][2]["end_seconds"] == bass["events"][1]["end_seconds"]
+
+
+def test_time_preview_constant_tempo_and_decimal_bpm():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    # One segment at a constant 60 BPM: 4 s per whole-note unit.
+    response = client.post(
+        f"/measures/{measure_id}/time-preview",
+        json={"segments": [{"end": "1", "start_bpm": "60", "end_bpm": "60"}]},
+    )
+    assert response.status_code == 200, response.text
+    events = response.json()["voices"][0]["events"]
+    assert events[0]["end_seconds"] == "2.000000"
+    assert events[-1]["end_seconds"] == "4.000000"
+
+    # Decimal BPM strings are accepted.
+    response = client.post(
+        f"/measures/{measure_id}/time-preview",
+        json={"segments": [{"end": "1", "start_bpm": "120.5", "end_bpm": "120.5"}]},
+    )
+    assert response.status_code == 200, response.text
+    events = response.json()["voices"][0]["events"]
+    assert events[-1]["end_seconds"] == f"{240 / 120.5:.6f}"
+
+
+def test_time_preview_404_for_missing_measure():
+    response = client.post("/measures/999999/time-preview", json=TEMPO_PAYLOAD)
+    assert response.status_code == 404
+
+
+def test_time_preview_rejects_invalid_tempo_segments():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    url = f"/measures/{measure_id}/time-preview"
+
+    # Last segment end must equal the target duration (1).
+    for last_end in ("1/2", "3/2"):
+        response = client.post(
+            url,
+            json={"segments": [
+                {"end": last_end, "start_bpm": "120", "end_bpm": "120"},
+            ]},
+        )
+        assert response.status_code == 422, last_end
+        assert "reason" in response.json()["detail"]
+
+    # Ends must be strictly increasing.
+    response = client.post(
+        url,
+        json={"segments": [
+            {"end": "1/2", "start_bpm": "120", "end_bpm": "120"},
+            {"end": "1/2", "start_bpm": "120", "end_bpm": "120"},
+            {"end": "1", "start_bpm": "120", "end_bpm": "120"},
+        ]},
+    )
+    assert response.status_code == 422
+
+    # Empty segment list / missing body / missing fields.
+    assert client.post(url, json={"segments": []}).status_code == 422
+    assert client.post(url, json={}).status_code == 422
+    assert client.post(
+        url, json={"segments": [{"end": "1", "start_bpm": "120"}]}
+    ).status_code == 422
+
+    # BPM must be a positive decimal string.
+    for bad_bpm in ("0", "0.0", "-3", "abc", "1/2", "1.2.3", ""):
+        response = client.post(
+            url,
+            json={"segments": [
+                {"end": "1", "start_bpm": bad_bpm, "end_bpm": "60"},
+            ]},
+        )
+        assert response.status_code == 422, bad_bpm
+        response = client.post(
+            url,
+            json={"segments": [
+                {"end": "1", "start_bpm": "120", "end_bpm": bad_bpm},
+            ]},
+        )
+        assert response.status_code == 422, bad_bpm
+
+    # Segment ends must be positive rational strings.
+    for bad_end in ("0", "-1/2", "1.5", "abc", "1/0"):
+        response = client.post(
+            url,
+            json={"segments": [
+                {"end": bad_end, "start_bpm": "120", "end_bpm": "60"},
+            ]},
+        )
+        assert response.status_code == 422, bad_end
+
+
+def test_time_preview_is_read_only():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    before = client.get(f"/measures/{measure_id}").json()
+    response = client.post(
+        f"/measures/{measure_id}/time-preview", json=TEMPO_PAYLOAD
+    )
+    assert response.status_code == 200
+    assert client.get(f"/measures/{measure_id}").json() == before

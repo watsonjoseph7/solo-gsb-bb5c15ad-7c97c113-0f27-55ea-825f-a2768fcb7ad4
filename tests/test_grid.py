@@ -1,5 +1,6 @@
 """Pure-logic tests: runnable with stdlib unittest or pytest."""
 
+import math
 import unittest
 from fractions import Fraction
 
@@ -8,14 +9,20 @@ from app.grid import (
     KIND_SOUND,
     LoopAlignmentTooLarge,
     QuantizationInfeasible,
+    TempoMapInvalid,
     align_loops,
     avoidance_muting,
+    build_tempo_map,
     build_voice_events,
     compute_grid,
     find_rhythm_match,
     find_sound_conflicts,
     format_rational,
+    format_seconds,
+    measure_time_preview,
+    offset_to_seconds,
     parse_nonnegative_rational,
+    parse_positive_decimal,
     parse_rational,
     quantize_measure,
     rational_lcm,
@@ -710,6 +717,146 @@ class AvoidanceMutingTest(unittest.TestCase):
                 or ("b", conflict["b"]["id"]) in muted
             )
             self.assertTrue(covered)
+
+
+class TempoMapTest(unittest.TestCase):
+    def test_parse_positive_decimal(self):
+        self.assertEqual(parse_positive_decimal("120"), 120.0)
+        self.assertEqual(parse_positive_decimal("90.5"), 90.5)
+        self.assertEqual(parse_positive_decimal("0.75"), 0.75)
+        for bad in [
+            "", "0", "0.0", "-3", "+4", "abc", "1/2", "1.2.3", ".5",
+            "5.", "1e2", "nan", "inf",
+        ]:
+            with self.assertRaises(ValueError, msg=bad):
+                parse_positive_decimal(bad)
+
+    def test_format_seconds_is_fixed_six_decimals(self):
+        self.assertEqual(format_seconds(0.0), "0.000000")
+        self.assertEqual(format_seconds(0.5), "0.500000")
+        self.assertEqual(format_seconds(2.3862943611198906), "2.386294")
+
+    def test_build_tempo_map_attaches_implicit_starts(self):
+        segments = [
+            {"end": Fraction(1, 2), "start_bpm": 120.0, "end_bpm": 120.0},
+            {"end": Fraction(1), "start_bpm": 120.0, "end_bpm": 60.0},
+        ]
+        prepared = build_tempo_map(segments, Fraction(1))
+        self.assertEqual(
+            [segment["start"] for segment in prepared],
+            [Fraction(0), Fraction(1, 2)],
+        )
+        self.assertEqual(
+            [segment["end"] for segment in prepared],
+            [Fraction(1, 2), Fraction(1)],
+        )
+
+    def test_build_tempo_map_rejects_invalid_segments(self):
+        base = {"start_bpm": 120.0, "end_bpm": 60.0}
+        # Empty map.
+        with self.assertRaises(TempoMapInvalid):
+            build_tempo_map([], Fraction(1))
+        # Last end must equal the target duration.
+        with self.assertRaises(TempoMapInvalid):
+            build_tempo_map([{"end": Fraction(1, 2), **base}], Fraction(1))
+        with self.assertRaises(TempoMapInvalid):
+            build_tempo_map([{"end": Fraction(3, 2), **base}], Fraction(1))
+        # Ends must be strictly increasing (repeat and decrease).
+        with self.assertRaises(TempoMapInvalid):
+            build_tempo_map(
+                [
+                    {"end": Fraction(1, 2), **base},
+                    {"end": Fraction(1, 2), **base},
+                    {"end": Fraction(1), **base},
+                ],
+                Fraction(1),
+            )
+        with self.assertRaises(TempoMapInvalid):
+            build_tempo_map(
+                [
+                    {"end": Fraction(3, 4), **base},
+                    {"end": Fraction(1, 2), **base},
+                    {"end": Fraction(1), **base},
+                ],
+                Fraction(1),
+            )
+
+    def test_constant_tempo_seconds(self):
+        # 120 BPM: one whole-note unit lasts 240/120 = 2 seconds.
+        prepared = build_tempo_map(
+            [{"end": Fraction(1), "start_bpm": 120.0, "end_bpm": 120.0}],
+            Fraction(1),
+        )
+        self.assertEqual(offset_to_seconds(prepared, Fraction(0)), 0.0)
+        self.assertAlmostEqual(offset_to_seconds(prepared, Fraction(1, 4)), 0.5)
+        self.assertAlmostEqual(offset_to_seconds(prepared, Fraction(1)), 2.0)
+
+    def test_linear_ramp_seconds(self):
+        # 120 -> 60 BPM over [0, 1]: total is 240*ln(120/60)/60 = 4 ln 2.
+        prepared = build_tempo_map(
+            [{"end": Fraction(1), "start_bpm": 120.0, "end_bpm": 60.0}],
+            Fraction(1),
+        )
+        self.assertAlmostEqual(
+            offset_to_seconds(prepared, Fraction(1)), 4 * math.log(2)
+        )
+        # Halfway the BPM is 90: 240*(1/2)*ln(120/90)/30 = 4 ln(4/3).
+        self.assertAlmostEqual(
+            offset_to_seconds(prepared, Fraction(1, 2)), 4 * math.log(4 / 3)
+        )
+
+    def test_accelerating_ramp_seconds(self):
+        # 60 -> 120 BPM over [0, 1]: total is 240*ln(120/60)/60 = 4 ln 2.
+        prepared = build_tempo_map(
+            [{"end": Fraction(1), "start_bpm": 60.0, "end_bpm": 120.0}],
+            Fraction(1),
+        )
+        self.assertAlmostEqual(
+            offset_to_seconds(prepared, Fraction(1)), 4 * math.log(2)
+        )
+
+    def test_cross_segment_integration_and_shared_offsets(self):
+        # [0, 1/2] constant 120 BPM, then [1/2, 1] linear 120 -> 60.
+        prepared = build_tempo_map(
+            [
+                {"end": Fraction(1, 2), "start_bpm": 120.0, "end_bpm": 120.0},
+                {"end": Fraction(1), "start_bpm": 120.0, "end_bpm": 60.0},
+            ],
+            Fraction(1),
+        )
+        self.assertAlmostEqual(offset_to_seconds(prepared, Fraction(1, 4)), 0.5)
+        self.assertAlmostEqual(offset_to_seconds(prepared, Fraction(1, 2)), 1.0)
+        # Second segment: 240*(1/2)*ln(120/60)/60 = 2 ln 2 on top of 1 s.
+        self.assertAlmostEqual(
+            offset_to_seconds(prepared, Fraction(1)), 1.0 + 2 * math.log(2)
+        )
+        # Offset 3/4 sits halfway through the ramp (BPM 90):
+        # 1 + 240*(1/4)*ln(120/90)/30 = 1 + 2 ln(4/3).
+        self.assertAlmostEqual(
+            offset_to_seconds(prepared, Fraction(3, 4)),
+            1.0 + 2 * math.log(4 / 3),
+        )
+
+        voices = make_voices(
+            [
+                ("a", [(KIND_SOUND, "1/2"), (KIND_REST, "1/2")]),
+                ("b", [(KIND_REST, "1/2"), (KIND_SOUND, "1/2")]),
+            ]
+        )
+        preview = measure_time_preview(prepared, voices)
+        a_events, b_events = preview[0]["events"], preview[1]["events"]
+        # The shared boundary 1/2 reuses one cached seconds value, so the
+        # floats (and their formatted strings) are identical everywhere.
+        self.assertEqual(a_events[0]["end_seconds"], a_events[1]["start_seconds"])
+        self.assertEqual(a_events[0]["end_seconds"], b_events[0]["end_seconds"])
+        self.assertEqual(a_events[0]["end_seconds"], b_events[1]["start_seconds"])
+        self.assertEqual(a_events[1]["end_seconds"], b_events[1]["end_seconds"])
+        self.assertEqual(
+            [event["id"] for event in a_events], ["v1e1", "v1e2"]
+        )
+        self.assertEqual(
+            [event["kind"] for event in b_events], [KIND_REST, KIND_SOUND]
+        )
 
 
 if __name__ == "__main__":
