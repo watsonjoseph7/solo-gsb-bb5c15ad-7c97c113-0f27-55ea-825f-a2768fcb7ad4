@@ -11,6 +11,7 @@ import re
 import sys
 from bisect import bisect_right
 from collections import deque
+from decimal import ROUND_HALF_UP, Decimal, localcontext
 from fractions import Fraction
 from math import gcd, lcm
 
@@ -751,3 +752,197 @@ def avoidance_muting(voice_a: dict, voice_b: dict) -> dict:
             (entry["event"]["duration"] for entry in muted), Fraction(0)
         ),
     }
+
+
+# --- Tempo segments: mapping measure offsets to wall-clock seconds --------
+
+# A positive decimal: "120", "120.5" (no sign, no exponent, digits on
+# both sides of the optional decimal point).
+_DECIMAL_RE = re.compile(r"^\d+(?:\.\d+)?$")
+
+# Seconds in one whole note at 1 BPM: 4 quarter notes * 60 seconds.
+_WHOLE_NOTE_SECONDS = Decimal(240)
+
+# Significant digits for the tempo integration; far beyond the six
+# decimals reported, so rounding only ever happens at formatting time.
+_TEMPO_PRECISION = 50
+
+
+def parse_positive_decimal(text: str) -> Decimal:
+    """Parse a positive decimal string ("120", "120.5") into a Decimal.
+
+    Raises ValueError on malformed input or non-positive values.
+    """
+    if not isinstance(text, str):
+        raise ValueError(f"decimal must be a string, got {type(text).__name__}")
+    stripped = text.strip()
+    if not _DECIMAL_RE.match(stripped):
+        raise ValueError(f"invalid decimal number: {text!r}")
+    value = Decimal(stripped)
+    if value <= 0:
+        raise ValueError(f"bpm must be positive, got {text!r}")
+    return value
+
+
+def format_seconds(value: Decimal) -> str:
+    """Fixed-point string with exactly six decimals, rounded half-up."""
+    with localcontext() as context:
+        # Digits before the point plus the six after, with one spare in
+        # case rounding carries into a new order of magnitude.
+        context.prec = max(value.adjusted(), 0) + 8
+        quantized = value.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+    return format(quantized, "f")
+
+
+class TempoSegmentsInvalid(ValueError):
+    """Tempo segments fail to chain over the measure's target duration."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"invalid tempo segments: {reason}")
+        self.reason = reason
+
+
+def build_tempo_segments(length: Fraction, raw_segments: list[dict]) -> list[dict]:
+    """Parse and validate tempo segments against the measure length.
+
+    ``raw_segments`` items are {"end": str, "start_bpm": str,
+    "end_bpm": str}. The first segment starts at offset 0 and every
+    later segment starts where the previous one ended, so the ends must
+    be positive rationals in strictly increasing order and the final end
+    must equal the measure ``length``. BPM values are positive decimal
+    strings (quarter notes per minute); a jump between one segment's
+    end_bpm and the next segment's start_bpm is allowed. Returns
+    normalized segments {"start", "end", "start_bpm", "end_bpm"} with
+    Fraction offsets and Decimal bpms. Raises TempoSegmentsInvalid on
+    any violation.
+    """
+    if not raw_segments:
+        raise TempoSegmentsInvalid("at least one tempo segment is required")
+
+    segments = []
+    start = Fraction(0)
+    for index, raw in enumerate(raw_segments):
+        label = f"segment {index + 1}"
+        try:
+            end = parse_rational(raw["end"])
+        except ValueError as exc:
+            raise TempoSegmentsInvalid(f"{label}: {exc}") from exc
+        bpms = []
+        for field in ("start_bpm", "end_bpm"):
+            try:
+                bpms.append(parse_positive_decimal(raw[field]))
+            except ValueError as exc:
+                raise TempoSegmentsInvalid(f"{label}: {exc}") from exc
+        if end <= start:
+            raise TempoSegmentsInvalid(
+                f"{label} end {format_rational(end)} must be greater than "
+                f"the previous segment end {format_rational(start)}"
+            )
+        segments.append(
+            {
+                "start": start,
+                "end": end,
+                "start_bpm": bpms[0],
+                "end_bpm": bpms[1],
+            }
+        )
+        start = end
+
+    last_end = segments[-1]["end"]
+    if last_end != length:
+        raise TempoSegmentsInvalid(
+            f"the final segment end {format_rational(last_end)} must equal "
+            f"the measure target duration {format_rational(length)}"
+        )
+    return segments
+
+
+def _fraction_to_decimal(value: Fraction) -> Decimal:
+    """Decimal view of a Fraction, rounded to the working precision."""
+    return Decimal(value.numerator) / Decimal(value.denominator)
+
+
+def _tempo_span_seconds(span: Decimal, bpm_from: Decimal, bpm_to: Decimal) -> Decimal:
+    """Seconds to cross ``span`` whole notes of one linear tempo span.
+
+    The bpm moves linearly from ``bpm_from`` to ``bpm_to`` across the
+    span, so the elapsed time is the integral of 240/bpm(x): a plain
+    ratio for constant tempo, the logarithmic form otherwise.
+    """
+    if bpm_from == bpm_to:
+        return _WHOLE_NOTE_SECONDS * span / bpm_from
+    return (
+        _WHOLE_NOTE_SECONDS
+        * span
+        / (bpm_to - bpm_from)
+        * (bpm_to / bpm_from).ln()
+    )
+
+
+def compute_time_preview(voices: list[dict], segments: list[dict]) -> dict:
+    """Integrate every event boundary to seconds under the tempo segments.
+
+    ``voices`` items are {"name": str, "events": [built events]} and
+    ``segments`` normalized tempo segments from ``build_tempo_segments``
+    covering [0, measure length]. Offsets count whole notes and bpm
+    counts quarter notes per minute, so one whole note at a constant
+    bpm b lasts 240/b seconds; within a segment the bpm varies linearly
+    with the offset. A bpm jump at a shared segment boundary never
+    changes the cumulative seconds there (a single point has zero
+    length), so both neighbouring segments agree on the boundary value.
+
+    Each distinct boundary offset is integrated exactly once and the
+    resulting Decimal is reused wherever the same offset recurs, within
+    or across voices. All arithmetic runs at _TEMPO_PRECISION significant
+    digits; rounding only happens when the caller formats. Returns
+    {"total_seconds": Decimal, "voices": [{"name", "events"}]} with
+    per-event start_seconds/end_seconds Decimals.
+    """
+    with localcontext() as context:
+        context.prec = _TEMPO_PRECISION
+
+        # Cumulative seconds at each segment start (index 0 is offset 0).
+        boundary_seconds = [Decimal(0)]
+        for segment in segments:
+            span = _fraction_to_decimal(segment["end"] - segment["start"])
+            boundary_seconds.append(
+                boundary_seconds[-1]
+                + _tempo_span_seconds(
+                    span, segment["start_bpm"], segment["end_bpm"]
+                )
+            )
+
+        ends = [segment["end"] for segment in segments]
+        cache: dict[Fraction, Decimal] = {}
+
+        def seconds_at(offset: Fraction) -> Decimal:
+            if offset not in cache:
+                # A boundary shared by two segments lands in the later
+                # one (elapsed 0 there); both choices give the same value.
+                index = min(bisect_right(ends, offset), len(segments) - 1)
+                segment = segments[index]
+                span = _fraction_to_decimal(segment["end"] - segment["start"])
+                elapsed = _fraction_to_decimal(offset - segment["start"])
+                bpm_at = segment["start_bpm"] + (
+                    segment["end_bpm"] - segment["start_bpm"]
+                ) * elapsed / span
+                # The covered part is itself a linear tempo span.
+                cache[offset] = boundary_seconds[index] + _tempo_span_seconds(
+                    elapsed, segment["start_bpm"], bpm_at
+                )
+            return cache[offset]
+
+        timed_voices = []
+        for voice in voices:
+            events = [
+                {
+                    "id": event["id"],
+                    "kind": event["kind"],
+                    "start_seconds": seconds_at(event["start"]),
+                    "end_seconds": seconds_at(event["end"]),
+                }
+                for event in voice["events"]
+            ]
+            timed_voices.append({"name": voice["name"], "events": events})
+
+        return {"total_seconds": boundary_seconds[-1], "voices": timed_voices}

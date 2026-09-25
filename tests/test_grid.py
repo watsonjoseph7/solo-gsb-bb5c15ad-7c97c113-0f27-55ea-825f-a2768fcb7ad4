@@ -1,6 +1,7 @@
 """Pure-logic tests: runnable with stdlib unittest or pytest."""
 
 import unittest
+from decimal import Decimal
 from fractions import Fraction
 
 from app.grid import (
@@ -8,14 +9,19 @@ from app.grid import (
     KIND_SOUND,
     LoopAlignmentTooLarge,
     QuantizationInfeasible,
+    TempoSegmentsInvalid,
     align_loops,
     avoidance_muting,
+    build_tempo_segments,
     build_voice_events,
     compute_grid,
+    compute_time_preview,
     find_rhythm_match,
     find_sound_conflicts,
     format_rational,
+    format_seconds,
     parse_nonnegative_rational,
+    parse_positive_decimal,
     parse_rational,
     quantize_measure,
     rational_lcm,
@@ -710,6 +716,238 @@ class AvoidanceMutingTest(unittest.TestCase):
                 or ("b", conflict["b"]["id"]) in muted
             )
             self.assertTrue(covered)
+
+
+class ParsePositiveDecimalTest(unittest.TestCase):
+    def test_accepts_integer_and_decimal_forms(self):
+        self.assertEqual(parse_positive_decimal("120"), Decimal(120))
+        self.assertEqual(parse_positive_decimal("120.5"), Decimal("120.5"))
+        self.assertEqual(parse_positive_decimal("0.25"), Decimal("0.25"))
+        self.assertEqual(parse_positive_decimal("007"), Decimal(7))
+
+    def test_rejects_bad_input(self):
+        for bad in [
+            "", "abc", "0", "0.0", "-3", "+3", "1/2", "1e3", ".5", "5.",
+            "1.2.3",
+        ]:
+            with self.assertRaises(ValueError, msg=bad):
+                parse_positive_decimal(bad)
+
+    def test_surrounding_whitespace_is_ignored(self):
+        # Same convention as the rational parser.
+        self.assertEqual(parse_positive_decimal(" 120 "), Decimal(120))
+
+
+class FormatSecondsTest(unittest.TestCase):
+    def test_always_six_decimals(self):
+        self.assertEqual(format_seconds(Decimal(0)), "0.000000")
+        self.assertEqual(format_seconds(Decimal("1.5")), "1.500000")
+        self.assertEqual(format_seconds(Decimal(2)), "2.000000")
+
+    def test_rounds_half_up(self):
+        self.assertEqual(format_seconds(Decimal("0.1234565")), "0.123457")
+        self.assertEqual(format_seconds(Decimal("0.1234564")), "0.123456")
+        self.assertEqual(format_seconds(Decimal("2.772588722239781")), "2.772589")
+
+    def test_carry_into_new_order_of_magnitude(self):
+        self.assertEqual(
+            format_seconds(Decimal("999999.9999999")), "1000000.000000"
+        )
+
+
+class BuildTempoSegmentsTest(unittest.TestCase):
+    def test_chained_segments_are_normalized(self):
+        segments = build_tempo_segments(
+            Fraction(1),
+            [
+                {"end": "1/2", "start_bpm": "120", "end_bpm": "120"},
+                {"end": "1", "start_bpm": "60", "end_bpm": "90.5"},
+            ],
+        )
+        self.assertEqual(
+            [(s["start"], s["end"]) for s in segments],
+            [(Fraction(0), Fraction(1, 2)), (Fraction(1, 2), Fraction(1))],
+        )
+        self.assertEqual(segments[0]["start_bpm"], Decimal(120))
+        self.assertEqual(segments[1]["end_bpm"], Decimal("90.5"))
+
+    def test_single_segment_covering_the_measure(self):
+        segments = build_tempo_segments(
+            Fraction(3, 2),
+            [{"end": "3/2", "start_bpm": "60", "end_bpm": "60"}],
+        )
+        self.assertEqual(
+            [(s["start"], s["end"]) for s in segments],
+            [(Fraction(0), Fraction(3, 2))],
+        )
+
+    def test_rejects_empty_list(self):
+        with self.assertRaises(TempoSegmentsInvalid):
+            build_tempo_segments(Fraction(1), [])
+
+    def test_rejects_non_increasing_ends(self):
+        with self.assertRaises(TempoSegmentsInvalid):
+            build_tempo_segments(
+                Fraction(1),
+                [
+                    {"end": "1/2", "start_bpm": "120", "end_bpm": "120"},
+                    {"end": "1/2", "start_bpm": "120", "end_bpm": "120"},
+                ],
+            )
+        with self.assertRaises(TempoSegmentsInvalid):
+            build_tempo_segments(
+                Fraction(1),
+                [
+                    {"end": "3/4", "start_bpm": "120", "end_bpm": "120"},
+                    {"end": "1/2", "start_bpm": "120", "end_bpm": "120"},
+                ],
+            )
+
+    def test_rejects_final_end_not_matching_target(self):
+        with self.assertRaises(TempoSegmentsInvalid) as ctx:
+            build_tempo_segments(
+                Fraction(1),
+                [{"end": "3/4", "start_bpm": "120", "end_bpm": "120"}],
+            )
+        self.assertIn("3/4", str(ctx.exception))
+        with self.assertRaises(TempoSegmentsInvalid):
+            build_tempo_segments(
+                Fraction(1),
+                [{"end": "5/4", "start_bpm": "120", "end_bpm": "120"}],
+            )
+
+    def test_rejects_bad_formats(self):
+        for bad_segment in [
+            {"end": "1.5", "start_bpm": "120", "end_bpm": "120"},
+            {"end": "0", "start_bpm": "120", "end_bpm": "120"},
+            {"end": "1", "start_bpm": "0", "end_bpm": "120"},
+            {"end": "1", "start_bpm": "120", "end_bpm": "abc"},
+            {"end": "1", "start_bpm": "1/2", "end_bpm": "120"},
+        ]:
+            with self.assertRaises(TempoSegmentsInvalid, msg=bad_segment):
+                build_tempo_segments(Fraction(1), [bad_segment])
+
+
+class ComputeTimePreviewTest(unittest.TestCase):
+    def test_constant_tempo_whole_note_lasts_240_over_bpm_seconds(self):
+        # 120 bpm => quarter note 0.5 s, whole note 2 s.
+        voices = make_voices(
+            [
+                ("a", [(KIND_SOUND, "1/2"), (KIND_REST, "1/2")]),
+                ("b", [(KIND_REST, "1/4"), (KIND_SOUND, "3/4")]),
+            ]
+        )
+        segments = build_tempo_segments(
+            Fraction(1),
+            [{"end": "1", "start_bpm": "120", "end_bpm": "120"}],
+        )
+        result = compute_time_preview(voices, segments)
+        self.assertEqual(result["total_seconds"], Decimal(2))
+        events_a = result["voices"][0]["events"]
+        self.assertEqual(events_a[0]["start_seconds"], Decimal(0))
+        self.assertEqual(events_a[0]["end_seconds"], Decimal(1))
+        self.assertEqual(events_a[1]["start_seconds"], Decimal(1))
+        self.assertEqual(events_a[1]["end_seconds"], Decimal(2))
+        # Quarter-note offset lands halfway through the whole note.
+        events_b = result["voices"][1]["events"]
+        self.assertEqual(events_b[0]["end_seconds"], Decimal("0.5"))
+
+    def test_linear_ramp_integrates_logarithmically(self):
+        # bpm 120 -> 60 over one whole note:
+        # t = 240/(60-120) * ln(60/120) = 4*ln(2) seconds.
+        voices = make_voices([("a", [(KIND_SOUND, "1")])])
+        segments = build_tempo_segments(
+            Fraction(1),
+            [{"end": "1", "start_bpm": "120", "end_bpm": "60"}],
+        )
+        result = compute_time_preview(voices, segments)
+        self.assertEqual(
+            format_seconds(result["total_seconds"]), "2.772589"
+        )
+        # Midpoint: bpm 90 there, t = 4*ln(120/90) = 4*ln(4/3).
+        (event,) = result["voices"][0]["events"]
+        self.assertEqual(event["start_seconds"], Decimal(0))
+        self.assertEqual(
+            format_seconds(event["end_seconds"]), "2.772589"
+        )
+
+    def test_bpm_jump_between_segments_is_allowed(self):
+        # 120 -> 60 over the first half, then a jump to a constant 240.
+        voices = make_voices([("a", [(KIND_SOUND, "1")])])
+        segments = build_tempo_segments(
+            Fraction(1),
+            [
+                {"end": "1/2", "start_bpm": "120", "end_bpm": "60"},
+                {"end": "1", "start_bpm": "240", "end_bpm": "240"},
+            ],
+        )
+        result = compute_time_preview(voices, segments)
+        # First half: 2*ln(2) s; second half: 240*(1/2)/240 = 1/2 s.
+        self.assertEqual(
+            format_seconds(result["total_seconds"]),
+            format_seconds(
+                Decimal(2) * Decimal(2).ln() + Decimal("0.5")
+            ),
+        )
+        self.assertEqual(format_seconds(result["total_seconds"]), "1.886294")
+
+    def test_same_offset_reuses_the_same_seconds_value(self):
+        # Boundary 1/2 is shared by two events within voice a and across
+        # voices a and b; every occurrence must report the identical
+        # value (the cache returns the very same Decimal object).
+        voices = make_voices(
+            [
+                ("a", [(KIND_SOUND, "1/2"), (KIND_REST, "1/2")]),
+                ("b", [(KIND_REST, "1/2"), (KIND_SOUND, "1/2")]),
+            ]
+        )
+        segments = build_tempo_segments(
+            Fraction(1),
+            [{"end": "1", "start_bpm": "120", "end_bpm": "60"}],
+        )
+        result = compute_time_preview(voices, segments)
+        events_a = result["voices"][0]["events"]
+        events_b = result["voices"][1]["events"]
+        shared = events_a[0]["end_seconds"]
+        self.assertIs(events_a[1]["start_seconds"], shared)
+        self.assertIs(events_b[0]["end_seconds"], shared)
+        self.assertIs(events_b[1]["start_seconds"], shared)
+        # t(1/2) = 240/(60-120) * ln(90/120) = 4*ln(4/3).
+        self.assertEqual(format_seconds(shared), "1.150728")
+
+    def test_offsets_across_segments_chain_cumulatively(self):
+        # VALID_PAYLOAD-shaped measure, constant 120 then a 120->60 ramp.
+        voices = make_voices(
+            [
+                (
+                    "melody",
+                    [(KIND_SOUND, "1/2"), (KIND_REST, "1/4"), (KIND_SOUND, "1/4")],
+                ),
+                ("bass", [(KIND_REST, "1/4"), (KIND_SOUND, "3/4")]),
+            ]
+        )
+        segments = build_tempo_segments(
+            Fraction(1),
+            [
+                {"end": "1/2", "start_bpm": "120", "end_bpm": "120"},
+                {"end": "1", "start_bpm": "120", "end_bpm": "60"},
+            ],
+        )
+        result = compute_time_preview(voices, segments)
+        melody = result["voices"][0]["events"]
+        self.assertEqual(
+            [format_seconds(e["start_seconds"]) for e in melody],
+            ["0.000000", "1.000000", "1.575364"],
+        )
+        self.assertEqual(
+            [format_seconds(e["end_seconds"]) for e in melody],
+            ["1.000000", "1.575364", "2.386294"],
+        )
+        bass = result["voices"][1]["events"]
+        self.assertEqual(format_seconds(bass[0]["end_seconds"]), "0.500000")
+        self.assertEqual(format_seconds(bass[1]["start_seconds"]), "0.500000")
+        self.assertEqual(format_seconds(bass[1]["end_seconds"]), "2.386294")
+        self.assertEqual(format_seconds(result["total_seconds"]), "2.386294")
 
 
 if __name__ == "__main__":

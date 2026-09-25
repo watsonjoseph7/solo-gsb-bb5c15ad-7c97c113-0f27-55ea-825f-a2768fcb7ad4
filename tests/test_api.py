@@ -772,3 +772,159 @@ def test_avoidance_preview_404_takes_precedence_over_same_voice():
         json={"voice_a": "x", "voice_b": "x"},
     )
     assert response.status_code == 404
+
+
+# --- POST /measures/{id}/time-preview --------------------------------------
+
+# Constant 120 bpm up to 1/2, then a linear 120 -> 60 ramp to the end.
+# Whole note = 1, so a constant 120 bpm whole note lasts 240/120 = 2 s:
+# t(1/4) = 0.5, t(1/2) = 1. The ramp adds 240*(1/2)/(60-120)*ln(60/120)
+# = 2*ln(2) s; at offset 3/4 the bpm is 90 and the ramp has added
+# 240*(1/4)/(90-120)*ln(90/120) = 2*ln(4/3) s.
+TIME_SEGMENTS = [
+    {"end": "1/2", "start_bpm": "120", "end_bpm": "120"},
+    {"end": "1", "start_bpm": "120", "end_bpm": "60"},
+]
+
+
+def test_time_preview_integrates_event_boundaries_to_seconds():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/time-preview", json={"segments": TIME_SEGMENTS}
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["measure_id"] == measure_id
+    assert body["target_duration"] == "1"
+    assert body["total_seconds"] == "2.386294"
+
+    melody, bass = body["voices"]
+    assert melody["name"] == "melody"
+    assert melody["events"] == [
+        {"id": "v1e1", "kind": "sound",
+         "start_seconds": "0.000000", "end_seconds": "1.000000"},
+        {"id": "v1e2", "kind": "rest",
+         "start_seconds": "1.000000", "end_seconds": "1.575364"},
+        {"id": "v1e3", "kind": "sound",
+         "start_seconds": "1.575364", "end_seconds": "2.386294"},
+    ]
+    assert bass["name"] == "bass"
+    assert bass["events"] == [
+        {"id": "v2e1", "kind": "rest",
+         "start_seconds": "0.000000", "end_seconds": "0.500000"},
+        {"id": "v2e2", "kind": "sound",
+         "start_seconds": "0.500000", "end_seconds": "2.386294"},
+    ]
+
+
+def test_time_preview_constant_tempo_single_segment():
+    # 60 bpm: one whole note lasts 240/60 = 4 s.
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/time-preview",
+        json={"segments": [
+            {"end": "1", "start_bpm": "60", "end_bpm": "60"},
+        ]},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["total_seconds"] == "4.000000"
+    first = body["voices"][0]["events"][0]
+    assert first["start_seconds"] == "0.000000"
+    assert first["end_seconds"] == "2.000000"  # half a whole note
+
+
+def test_time_preview_allows_bpm_jumps_between_segments():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/time-preview",
+        json={"segments": [
+            {"end": "1/2", "start_bpm": "120", "end_bpm": "60"},
+            {"end": "1", "start_bpm": "240", "end_bpm": "240"},
+        ]},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    # First half: 2*ln(2) s; second half at constant 240: 1/2 s.
+    assert body["total_seconds"] == "1.886294"
+    # The shared segment boundary maps to one value in every voice.
+    melody = body["voices"][0]["events"]
+    assert melody[0]["end_seconds"] == "1.386294"
+    assert melody[1]["start_seconds"] == "1.386294"
+
+
+def test_time_preview_is_read_only():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    before = client.get(f"/measures/{measure_id}").json()
+    response = client.post(
+        f"/measures/{measure_id}/time-preview", json={"segments": TIME_SEGMENTS}
+    )
+    assert response.status_code == 200
+    assert client.get(f"/measures/{measure_id}").json() == before
+
+
+def test_time_preview_404_for_missing_measure():
+    response = client.post(
+        "/measures/999999/time-preview", json={"segments": TIME_SEGMENTS}
+    )
+    assert response.status_code == 404
+
+
+def test_time_preview_rejects_segments_not_covering_target():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    for segments in (
+        # Final end short of the target duration.
+        [{"end": "3/4", "start_bpm": "120", "end_bpm": "120"}],
+        # Final end beyond the target duration.
+        [{"end": "5/4", "start_bpm": "120", "end_bpm": "120"}],
+        # Ends not strictly increasing.
+        [
+            {"end": "1/2", "start_bpm": "120", "end_bpm": "120"},
+            {"end": "1/2", "start_bpm": "120", "end_bpm": "120"},
+        ],
+        [
+            {"end": "3/4", "start_bpm": "120", "end_bpm": "120"},
+            {"end": "1/2", "start_bpm": "120", "end_bpm": "120"},
+        ],
+    ):
+        response = client.post(
+            f"/measures/{measure_id}/time-preview", json={"segments": segments}
+        )
+        assert response.status_code == 422, segments
+        detail = response.json()["detail"]
+        assert "reason" in detail
+        assert detail["target_duration"] == "1"
+
+
+def test_time_preview_validates_payload():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    # Empty segment list.
+    assert client.post(
+        f"/measures/{measure_id}/time-preview", json={"segments": []}
+    ).status_code == 422
+    # BPM must be a positive decimal string.
+    for bad_bpm in ("0", "0.0", "-60", "abc", "1/2", "1e2"):
+        response = client.post(
+            f"/measures/{measure_id}/time-preview",
+            json={"segments": [
+                {"end": "1", "start_bpm": bad_bpm, "end_bpm": "120"},
+            ]},
+        )
+        assert response.status_code == 422, bad_bpm
+    # end must be a positive rational string.
+    for bad_end in ("0", "-1/2", "1.5", "abc", "1/0"):
+        response = client.post(
+            f"/measures/{measure_id}/time-preview",
+            json={"segments": [
+                {"end": bad_end, "start_bpm": "120", "end_bpm": "120"},
+            ]},
+        )
+        assert response.status_code == 422, bad_end
+    # Missing body / fields are request-validation errors too.
+    assert client.post(
+        f"/measures/{measure_id}/time-preview", json={}
+    ).status_code == 422
+    assert client.post(
+        f"/measures/{measure_id}/time-preview",
+        json={"segments": [{"end": "1", "start_bpm": "120"}]},
+    ).status_code == 422

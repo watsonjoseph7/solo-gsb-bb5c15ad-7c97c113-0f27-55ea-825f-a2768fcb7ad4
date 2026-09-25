@@ -32,6 +32,16 @@ finds a set of whole events to mute minimizing the sum of their
 original durations (a minimum-weight vertex cover over the bipartite
 conflict graph, solved in exact fractions). It is a preview only;
 nothing is written back to SQLite.
+
+A saved measure's event offsets can also be previewed in wall-clock
+seconds (POST /measures/{id}/time-preview): the request gives a chain
+of tempo segments — each an end offset plus start/end BPM (quarter
+notes per minute, linear within the segment, jumps allowed between
+segments) — covering the target duration. Every event boundary is
+integrated to seconds from the measure start (whole note = 1); each
+distinct offset is converted once and the same value reused. Results
+carry six decimal places. It is a preview only; nothing is written
+back to SQLite.
 """
 
 from __future__ import annotations
@@ -46,12 +56,16 @@ from .grid import (
     MAX_EXPANDED_EVENTS,
     LoopAlignmentTooLarge,
     QuantizationInfeasible,
+    TempoSegmentsInvalid,
     align_loops,
     avoidance_muting,
+    build_tempo_segments,
     build_voice_events,
     compute_grid,
+    compute_time_preview,
     find_rhythm_match,
     format_rational,
+    format_seconds,
     parse_nonnegative_rational,
     parse_rational,
     quantize_measure,
@@ -69,6 +83,8 @@ from .schemas import (
     QuantizationPreviewIn,
     QuantizationPreviewOut,
     RhythmMatchesOut,
+    TimePreviewIn,
+    TimePreviewOut,
 )
 
 
@@ -100,6 +116,7 @@ def root() -> dict:
             "rhythm_matches": "GET /measures/{id}/rhythm-matches?voice={name}",
             "loop_alignments": "POST /loop-alignments",
             "avoidance_preview": "POST /measures/{id}/avoidance-preview",
+            "time_preview": "POST /measures/{id}/time-preview",
         },
     }
 
@@ -445,5 +462,55 @@ def avoidance_preview(measure_id: int, payload: AvoidancePreviewIn) -> dict:
                 "overlap": format_rational(conflict["overlap"]),
             }
             for conflict in result["conflicts"]
+        ],
+    }
+
+
+@app.post(
+    "/measures/{measure_id}/time-preview",
+    response_model=TimePreviewOut,
+)
+def time_preview(measure_id: int, payload: TimePreviewIn) -> dict:
+    # Read-only: offsets are integrated against the tempo segments in
+    # high-precision decimal arithmetic, but SQLite is never written to.
+    measure = db.load_measure(measure_id)
+    if measure is None:
+        raise HTTPException(status_code=404, detail="measure not found")
+
+    length, voices = _fraction_voices(measure)
+    try:
+        segments = build_tempo_segments(
+            length,
+            [segment.model_dump() for segment in payload.segments],
+        )
+    except TempoSegmentsInvalid as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "invalid tempo segments; nothing was saved",
+                "reason": exc.reason,
+                "target_duration": format_rational(length),
+            },
+        ) from exc
+
+    result = compute_time_preview(voices, segments)
+    return {
+        "measure_id": measure["id"],
+        "target_duration": measure["target_duration"],
+        "total_seconds": format_seconds(result["total_seconds"]),
+        "voices": [
+            {
+                "name": voice["name"],
+                "events": [
+                    {
+                        "id": event["id"],
+                        "kind": event["kind"],
+                        "start_seconds": format_seconds(event["start_seconds"]),
+                        "end_seconds": format_seconds(event["end_seconds"]),
+                    }
+                    for event in voice["events"]
+                ],
+            }
+            for voice in result["voices"]
         ],
     }
